@@ -22,6 +22,11 @@
 # serves at
 # https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
 # the app reads it without any Vercel bandwidth or functions.
+#
+# A run dispatched on any branch but main is a test: it starts from its own
+# test-store-* asset (the real store, copied, the first time), writes only
+# that, and publishes nothing, so trying a change can't touch what the app
+# reads or what the next scheduled run starts from.
 name: Crawl perk popularity
 
 on:
@@ -57,8 +62,8 @@ env:
   GH_TOKEN: ${{ github.token }}
   # The release whose assets hold the store.
   STORE_RELEASE: copies
-  # Store assets are named store-<run>-<id>.bin.
-  STORE_PREFIX: store-
+  # Store assets are named store-<run>-<id>.bin; a test run (any branch but main) keeps its own, test-store-*.
+  STORE_PREFIX: ${{ github.ref_name == 'main' && 'store-' || 'test-store-' }}
   POPULARITY_STORE_KEY: ${{ secrets.POPULARITY_STORE_KEY }}
 
 jobs:
@@ -90,8 +95,13 @@ jobs:
               --notes "The perk-popularity store, encrypted: every weapon copy of the players who've played in the last 14 days. Rewritten by every crawl."
           fi
           # The newest asset; older ones are only left behind by a run that failed before deleting them.
-          newest=$(gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
-            -q "[.assets[] | select(.name | startswith(\"$STORE_PREFIX\"))] | sort_by(.createdAt) | last | .name // empty")
+          newest() {
+            gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+              -q "[.assets[] | select(.name | startswith(\"$1\"))] | sort_by(.createdAt) | last | .name // empty"
+          }
+          newest=$(newest "$STORE_PREFIX")
+          # A test run with no store of its own yet starts from a copy of the real one.
+          if [ -z "$newest" ] && [ "$STORE_PREFIX" != store- ]; then newest=$(newest store-); fi
           if [ -n "$newest" ]; then
             gh release download "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --pattern "$newest" --output "$RUNNER_TEMP/store.bin"
           else
@@ -142,6 +152,8 @@ jobs:
             -q ".assets[] | select(.name | startswith(\"$STORE_PREFIX\")) | select(.name != \"$name\") | .name" |
             while read -r old; do gh release delete-asset "$STORE_RELEASE" "$old" -R "$GITHUB_REPOSITORY" --yes; done
       - name: Publish
+        # Only from main: what a test run merged stays in its test store.
+        if: github.ref_name == 'main'
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
