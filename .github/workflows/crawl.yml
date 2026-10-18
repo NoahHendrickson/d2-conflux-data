@@ -1,12 +1,17 @@
-# Perk-popularity crawl for D2 Conflux's weapon page (PvE only).
+# Perk-popularity crawl for D2 Conflux's weapon page.
 #
 # Every 3 hours a run checks out the app repo (public, so no token needed) at
 # the APP_REF repository variable (default main) and, with this repo's
-# BUNGIE_CRAWLER_API_KEY secret, spends 25 minutes sampling players from PvE
-# matches that ended in the last 15 minutes, so the weapons it reads are still
-# the ones they used. Each run is saved as daily/<UTC date>T<hour>.json. The
-# merge then adds up the last 7 days into perk-popularity.json and deletes
-# older files. GitHub Pages serves it at
+# BUNGIE_CRAWLER_API_KEY secret, spends 25 minutes finding players through PvE
+# matches that ended in the last 15 minutes and reading the perks on every
+# legendary they have equipped, plus their vault when it's public.
+#
+# Each copy counts once, by its item instance id: the copy store (every copy
+# seen in the last 14 days, gzipped binary, too big for git) lives as an
+# asset of this repo's "copies" release. A run downloads the newest one, folds
+# its crawl in, uploads the result as a new asset and only then deletes the
+# older ones, so a failed upload loses nothing. The merge also writes
+# perk-popularity.json, which GitHub Pages serves at
 # https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
 # the app reads it without any Vercel bandwidth or functions.
 name: Crawl perk popularity
@@ -21,19 +26,16 @@ on:
         description: Minutes to crawl for
         default: "25"
       recent:
-        description: Sample the matches that ended in the last this many minutes, moving along as it goes
+        description: Find players through the matches that ended in the last this many minutes, moving along as it goes
         default: "15"
       hours:
-        description: "Sample a fixed window of the past this many hours instead (leave empty for recent matches)"
+        description: "Use a fixed window of the past this many hours instead (leave empty for recent matches)"
         default: ""
       players:
         description: Stop early once this many players have been read
         default: "50000"
       app_ref:
         description: App repo branch or commit with the crawler (default the APP_REF variable)
-        default: ""
-      backfill_days:
-        description: "Backfill instead: UTC dates (YYYY-MM-DD, space-separated) to crawl the 24 hours before that day's 06:00 UTC. Days with any crawl saved are skipped."
         default: ""
 
 permissions:
@@ -43,10 +45,15 @@ concurrency:
   group: crawl
   cancel-in-progress: false
 
+env:
+  GH_TOKEN: ${{ github.token }}
+  # The release whose assets hold the copy store.
+  STORE_RELEASE: copies
+
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,12 +71,10 @@ jobs:
       - name: Install the app's dependencies
         working-directory: app
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Crawl recent matches (or backfill past days)
-        id: crawl
+      - name: Crawl recent matches
         working-directory: app
         env:
           BUNGIE_CRAWLER_API_KEY: ${{ secrets.BUNGIE_CRAWLER_API_KEY }}
-          BACKFILL_DAYS: ${{ inputs.backfill_days }}
           MINUTES: ${{ inputs.minutes || '25' }}
           RECENT: ${{ inputs.recent || '15' }}
           HOURS: ${{ inputs.hours }}
@@ -77,50 +82,48 @@ jobs:
         # The rate is the crawler's own default for the crawler key: 20 requests a
         # second, slowing down for good each time Bungie throttles.
         run: |
-          mkdir -p ../data/daily
-          crawl() { npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" "$@"; }
-          if [ -n "$BACKFILL_DAYS" ]; then
-            # One day after another in this one run (separate runs would cancel
-            # each other's queue slot). A day with any crawl saved is left alone.
-            echo "DAY=backfill $BACKFILL_DAYS" >> "$GITHUB_ENV"
-            for day in $BACKFILL_DAYS; do
-              if compgen -G "../data/daily/$day*.json" > /dev/null; then
-                echo "daily/$day already has a crawl; skipping."
-                continue
-              fi
-              crawl --day="$day" --hours=24 --minutes=75 --out="../data/daily/$day.json"
-              echo "crawled=true" >> "$GITHUB_OUTPUT"
-            done
-            exit 0
-          fi
           run=$(date -u +%FT%H)
-          echo "DAY=$run" >> "$GITHUB_ENV"
-          if [ -e "../data/daily/$run.json" ]; then
-            echo "daily/$run.json is already saved this hour; not overwriting it."
-            exit 0
+          echo "RUN=$run" >> "$GITHUB_ENV"
+          if [ -n "$HOURS" ]; then window=(--hours="$HOURS"); else window=(--recent="$RECENT"); fi
+          npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" --minutes="$MINUTES" "${window[@]}" --out="$RUNNER_TEMP/$run.bin.gz"
+      - name: Download the copy store
+        run: |
+          if ! gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --title "Copy store" \
+              --notes "The perk-popularity copy store: every weapon copy seen in the last 14 days. Rewritten by every crawl."
           fi
-          if [ -n "$HOURS" ]; then
-            crawl --hours="$HOURS" --minutes="$MINUTES" --out="../data/daily/$run.json"
+          # The newest asset; older ones are only left behind by a run that failed before deleting them.
+          newest=$(gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+            -q '[.assets[] | select(.name | startswith("copies-"))] | sort_by(.createdAt) | last | .name // empty')
+          echo "NEWEST=$newest" >> "$GITHUB_ENV"
+          if [ -n "$newest" ]; then
+            gh release download "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --pattern "$newest" --output "$RUNNER_TEMP/copies.bin.gz"
           else
-            crawl --recent="$RECENT" --minutes="$MINUTES" --out="../data/daily/$run.json"
+            echo "No copy store yet; the merge starts one."
           fi
-          echo "crawled=true" >> "$GITHUB_OUTPUT"
-      - name: Merge the last 7 days
-        if: steps.crawl.outputs.crawled == 'true'
+      - name: Merge into the copy store
         working-directory: app
         run: >
           npx tsx scripts/merge-perk-popularity.ts
-          --dir=../data/daily --days=7
-          --out=../data/perk-popularity.json --prune
+          --store="$RUNNER_TEMP/copies.bin.gz" --add="$RUNNER_TEMP/$RUN.bin.gz" --days=14
+          --out=../data/perk-popularity.json
+      - name: Upload the copy store
+        run: |
+          name="copies-$RUN-$GITHUB_RUN_ID.bin.gz"
+          cp "$RUNNER_TEMP/copies.bin.gz" "$RUNNER_TEMP/$name"
+          gh release upload "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" "$RUNNER_TEMP/$name"
+          # Only now that the new store is up: the older ones.
+          gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+            -q ".assets[] | select(.name | startswith(\"copies-\")) | select(.name != \"$name\") | .name" |
+            while read -r old; do gh release delete-asset "$STORE_RELEASE" "$old" -R "$GITHUB_REPOSITORY" --yes; done
       - name: Publish
-        if: steps.crawl.outputs.crawled == 'true'
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
-          git add -A daily perk-popularity.json
+          git add perk-popularity.json
           git diff --cached --quiet && exit 0
-          git commit -m "Perk popularity $DAY"
+          git commit -m "Perk popularity $RUN"
           # Another run may have published meanwhile; land on top of it.
           git pull --rebase
           git push
