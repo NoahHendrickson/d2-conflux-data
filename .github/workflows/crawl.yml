@@ -1,23 +1,28 @@
-# Weekly perk-popularity crawl for D2 Conflux's weapon page.
+# Daily perk-popularity crawl for D2 Conflux's weapon page (PvE only).
 #
-# Checks out the app repo (public, so no token needed), runs its crawler
-# against Bungie's public API with this repo's BUNGIE_CRAWLER_API_KEY secret,
-# and commits the snapshot here. GitHub Pages serves it at
-# https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json,
-# so the app reads it without any Vercel bandwidth or functions.
+# Each run checks out the app repo (public, so no token needed) at the APP_REF
+# repository variable (default main), samples about 20k players from the last
+# 24 hours of PvE matches with this repo's BUNGIE_CRAWLER_API_KEY secret, and
+# saves that day as daily/<UTC date>.json. The merge then adds up the last 7
+# days into perk-popularity.json and deletes older days. GitHub Pages serves it
+# at https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
+# the app reads it without any Vercel bandwidth or functions.
 name: Crawl perk popularity
 
 on:
   schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+    - cron: "0 6 * * *" # daily, 06:00 UTC
   workflow_dispatch:
     inputs:
       players:
         description: Players to sample
-        default: "50000"
+        default: "20000"
+      hours:
+        description: Hours of matches to sample from
+        default: "24"
       app_ref:
-        description: App repo branch or commit with the crawler
-        default: main
+        description: App repo branch or commit with the crawler (default the APP_REF variable)
+        default: ""
 
 permissions:
   contents: write
@@ -37,7 +42,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: NoahHendrickson/d2-stat-builder
-          ref: ${{ inputs.app_ref || 'main' }}
+          ref: ${{ inputs.app_ref || vars.APP_REF || 'main' }}
           path: app
       - uses: actions/setup-node@v4
         with:
@@ -47,21 +52,30 @@ jobs:
       - name: Install the app's dependencies
         working-directory: app
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Crawl
+      - name: Crawl the last day
         working-directory: app
         env:
           BUNGIE_CRAWLER_API_KEY: ${{ secrets.BUNGIE_CRAWLER_API_KEY }}
+        run: |
+          echo "DAY=$(date -u +%F)" >> "$GITHUB_ENV"
+          mkdir -p ../data/daily
+          npx tsx scripts/crawl-perk-popularity.ts \
+            --players=${{ inputs.players || '20000' }} \
+            --hours=${{ inputs.hours || '24' }} \
+            --minutes=240 --rate=8 --workers=6 \
+            --out=../data/daily/$(date -u +%F).json
+      - name: Merge the last 7 days
+        working-directory: app
         run: >
-          npx tsx scripts/crawl-perk-popularity.ts
-          --players=${{ inputs.players || '50000' }}
-          --minutes=300 --rate=8 --workers=6
-          --out=../data/perk-popularity.json
+          npx tsx scripts/merge-perk-popularity.ts
+          --dir=../data/daily --days=7
+          --out=../data/perk-popularity.json --prune
       - name: Publish
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
-          git add perk-popularity.json
+          git add -A daily perk-popularity.json
           git diff --cached --quiet && exit 0
-          git commit -m "Perk popularity $(date -u +%Y-%m-%d)"
+          git commit -m "Perk popularity $DAY"
           git push
