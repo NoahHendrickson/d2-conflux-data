@@ -7,6 +7,9 @@
 # and, with up to half its reads, players already in the store that it hasn't
 # read for a week. Each read gives the perks on every legendary they have
 # equipped, plus their vault when it's public, and when they last played.
+# Players signed in to D2 Conflux add their whole inventory: the site saves
+# their weapons as they load it, and each run reads the ones saved since its
+# last (POPULARITY_DATABASE_URL, a database role that can only read them).
 #
 # Each copy counts once, by its item instance id, for as long as its owner
 # keeps playing: a player who hasn't played for 14 days drops out with their
@@ -108,12 +111,27 @@ jobs:
           if [ -n "$HOURS" ]; then window=(--hours="$HOURS"); else window=(--recent="$RECENT"); fi
           store=(); if [ -e "$RUNNER_TEMP/store.bin" ]; then store=(--store="$RUNNER_TEMP/store.bin"); fi
           npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" --minutes="$MINUTES" "${window[@]}" "${store[@]}" --out="$RUNNER_TEMP/$RUN.bin"
+      - name: Read signed-in players' weapons
+        working-directory: app
+        # A database hiccup shouldn't cost the crawl: the merge goes on without them, and
+        # the next run picks up where the store says the last one left off.
+        continue-on-error: true
+        env:
+          POPULARITY_DATABASE_URL: ${{ secrets.POPULARITY_DATABASE_URL }}
+        # Skipped until the secret is set, or on an app ref from before the script.
+        run: |
+          if [ -z "$POPULARITY_DATABASE_URL" ] || [ ! -f scripts/fetch-popularity-contributions.ts ]; then
+            echo "Not reading signed-in players' weapons."; exit 0
+          fi
+          store=(); if [ -e "$RUNNER_TEMP/store.bin" ]; then store=(--store="$RUNNER_TEMP/store.bin"); fi
+          npx tsx scripts/fetch-popularity-contributions.ts "${store[@]}" --out="$RUNNER_TEMP/signed-in-$RUN.bin"
       - name: Merge into the store
         working-directory: app
-        run: >
-          npx tsx scripts/merge-perk-popularity.ts
-          --store="$RUNNER_TEMP/store.bin" --add="$RUNNER_TEMP/$RUN.bin" --days=14
-          --out=../data/perk-popularity.json
+        run: |
+          add=(--add="$RUNNER_TEMP/$RUN.bin")
+          if [ -e "$RUNNER_TEMP/signed-in-$RUN.bin" ]; then add+=(--add="$RUNNER_TEMP/signed-in-$RUN.bin"); fi
+          npx tsx scripts/merge-perk-popularity.ts --store="$RUNNER_TEMP/store.bin" "${add[@]}" --days=14 \
+            --out=../data/perk-popularity.json
       - name: Upload the store
         run: |
           name="$STORE_PREFIX$RUN-$GITHUB_RUN_ID.bin"
@@ -131,6 +149,8 @@ jobs:
           git add perk-popularity.json
           git diff --cached --quiet && exit 0
           git commit -m "Perk popularity $RUN"
-          # Another run may have published meanwhile; land on top of it.
-          git pull --rebase
+          # Another run may have published meanwhile (a run that waited for it checked out
+          # the commit it was triggered on): land on top, this snapshot winning, since it
+          # was built from the newer store.
+          git pull --rebase -X theirs
           git push
