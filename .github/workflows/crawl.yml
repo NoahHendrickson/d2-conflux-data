@@ -22,6 +22,17 @@
 # serves at
 # https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
 # the app reads it without any Vercel bandwidth or functions.
+#
+# A run dispatched on any branch but main, or on main with an app_ref (trying
+# a crawler change), is a test: it starts from its own test-store-* asset (the
+# real store, copied, the first time), writes only that, and publishes
+# nothing, so trying a change can't touch what the app reads or what the next
+# scheduled run starts from. That holds only on branches with this version of
+# the file: a branch cut before it still runs the old one. Tests share the
+# crawl concurrency group with scheduled runs (one Bungie key), so a test
+# delays the next scheduled run, and GitHub keeps one pending run per group:
+# a test dispatched while another test runs cancels a scheduled run waiting
+# behind it. Dispatch one test at a time.
 name: Crawl perk popularity
 
 on:
@@ -43,8 +54,12 @@ on:
         description: Stop early once this many players have been read
         default: "500000"
       app_ref:
-        description: App repo branch or commit with the crawler (default the APP_REF variable)
+        description: App repo branch or commit with the crawler (default the APP_REF variable; setting it makes the run a test)
         default: ""
+      bootstrap:
+        description: "On main, start a new store when the release has none (otherwise the run stops, since an empty store would publish an empty snapshot)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -57,8 +72,10 @@ env:
   GH_TOKEN: ${{ github.token }}
   # The release whose assets hold the store.
   STORE_RELEASE: copies
-  # Store assets are named store-<run>-<id>.bin.
-  STORE_PREFIX: store-
+  # A test run (see the top): dispatched off main, or on main with an app_ref. On a schedule there are no inputs.
+  TEST: ${{ github.ref_name != 'main' || inputs.app_ref != '' }}
+  # Store assets are named store-<run>-<id>-<attempt>.bin; a test run keeps its own, test-store-*.
+  STORE_PREFIX: ${{ (github.ref_name != 'main' || inputs.app_ref != '') && 'test-store-' || 'store-' }}
   POPULARITY_STORE_KEY: ${{ secrets.POPULARITY_STORE_KEY }}
 
 jobs:
@@ -83,17 +100,32 @@ jobs:
         working-directory: app
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Download the store
+        env:
+          BOOTSTRAP: ${{ inputs.bootstrap }}
         run: |
           echo "RUN=$(date -u +%FT%H)" >> "$GITHUB_ENV"
+          [ -n "$STORE_PREFIX" ] || { echo "::error::STORE_PREFIX is empty."; exit 1; }
+          created=false
           if ! gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --title "Copy store" \
               --notes "The perk-popularity store, encrypted: every weapon copy of the players who've played in the last 14 days. Rewritten by every crawl."
+            created=true
           fi
           # The newest asset; older ones are only left behind by a run that failed before deleting them.
-          newest=$(gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
-            -q "[.assets[] | select(.name | startswith(\"$STORE_PREFIX\"))] | sort_by(.createdAt) | last | .name // empty")
+          newest() {
+            gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+              -q "[.assets[] | select(.name | startswith(\"$1\"))] | sort_by(.createdAt) | last | .name // empty"
+          }
+          newest=$(newest "$STORE_PREFIX")
+          # A test run with no store of its own yet starts from a copy of the real one.
+          if [ -z "$newest" ] && [ "$TEST" = true ]; then newest=$(newest store-); fi
           if [ -n "$newest" ]; then
             gh release download "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --pattern "$newest" --output "$RUNNER_TEMP/store.bin"
+          elif [ "$TEST" = false ] && [ "$created" = false ] && [ "$BOOTSTRAP" != true ]; then
+            # The store is gone (deleted by hand, or the key changed): starting a new one here would
+            # publish a near-empty snapshot. Only a run asked to bootstrap does that.
+            echo "::error::The $STORE_RELEASE release has no $STORE_PREFIX* asset. Dispatch with bootstrap=true to start a new store."
+            exit 1
           else
             echo "No store yet; the merge starts one."
           fi
@@ -134,7 +166,9 @@ jobs:
             --out=../data/perk-popularity.json
       - name: Upload the store
         run: |
-          name="$STORE_PREFIX$RUN-$GITHUB_RUN_ID.bin"
+          [ -n "$STORE_PREFIX" ] || { echo "::error::STORE_PREFIX is empty."; exit 1; }
+          # The attempt too: a re-run in the same hour after a failed push would otherwise upload the same name again.
+          name="$STORE_PREFIX$RUN-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.bin"
           cp "$RUNNER_TEMP/store.bin" "$RUNNER_TEMP/$name"
           gh release upload "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" "$RUNNER_TEMP/$name"
           # Only now that the new store is up: the older ones.
@@ -142,6 +176,8 @@ jobs:
             -q ".assets[] | select(.name | startswith(\"$STORE_PREFIX\")) | select(.name != \"$name\") | .name" |
             while read -r old; do gh release delete-asset "$STORE_RELEASE" "$old" -R "$GITHUB_REPOSITORY" --yes; done
       - name: Publish
+        # Not from a test: what it merged stays in its test store.
+        if: env.TEST == 'false'
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
