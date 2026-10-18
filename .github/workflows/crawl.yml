@@ -23,6 +23,9 @@ on:
       app_ref:
         description: App repo branch or commit with the crawler (default the APP_REF variable)
         default: ""
+      backfill_days:
+        description: "Backfill instead: UTC dates (YYYY-MM-DD, space-separated) to crawl the way that day's scheduled run would have. Days already saved are skipped."
+        default: ""
 
 permissions:
   contents: write
@@ -52,18 +55,37 @@ jobs:
       - name: Install the app's dependencies
         working-directory: app
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Crawl the last day
+      - name: Crawl the last day (or backfill past days)
         working-directory: app
         env:
           BUNGIE_CRAWLER_API_KEY: ${{ secrets.BUNGIE_CRAWLER_API_KEY }}
+          BACKFILL_DAYS: ${{ inputs.backfill_days }}
+          PLAYERS: ${{ inputs.players || '20000' }}
+          HOURS: ${{ inputs.hours || '24' }}
         run: |
-          echo "DAY=$(date -u +%F)" >> "$GITHUB_ENV"
           mkdir -p ../data/daily
-          npx tsx scripts/crawl-perk-popularity.ts \
-            --players=${{ inputs.players || '20000' }} \
-            --hours=${{ inputs.hours || '24' }} \
-            --minutes=240 --rate=8 --workers=6 \
-            --out=../data/daily/$(date -u +%F).json
+          if [ -z "$BACKFILL_DAYS" ]; then
+            echo "DAY=$(date -u +%F)" >> "$GITHUB_ENV"
+            npx tsx scripts/crawl-perk-popularity.ts \
+              --players="$PLAYERS" --hours="$HOURS" \
+              --minutes=240 --rate=8 --workers=6 \
+              --out=../data/daily/$(date -u +%F).json
+            exit 0
+          fi
+          # Backfill: one day after another in this one run (separate runs
+          # would cancel each other's queue slot). A day already saved is
+          # never overwritten.
+          echo "DAY=backfill $BACKFILL_DAYS" >> "$GITHUB_ENV"
+          for day in $BACKFILL_DAYS; do
+            if [ -e "../data/daily/$day.json" ]; then
+              echo "daily/$day.json is already saved; skipping."
+              continue
+            fi
+            npx tsx scripts/crawl-perk-popularity.ts \
+              --day="$day" --players="$PLAYERS" --hours="$HOURS" \
+              --minutes=75 --rate=8 --workers=6 \
+              --out="../data/daily/$day.json"
+          done
       - name: Merge the last 7 days
         working-directory: app
         run: >
@@ -78,4 +100,6 @@ jobs:
           git add -A daily perk-popularity.json
           git diff --cached --quiet && exit 0
           git commit -m "Perk popularity $DAY"
+          # Another run may have published meanwhile; land on top of it.
+          git pull --rebase
           git push
