@@ -2,16 +2,24 @@
 #
 # Every 3 hours a run checks out the app repo (public, so no token needed) at
 # the APP_REF repository variable (default main) and, with this repo's
-# BUNGIE_CRAWLER_API_KEY secret, spends 25 minutes finding players through PvE
-# matches that ended in the last 15 minutes and reading the perks on every
-# legendary they have equipped, plus their vault when it's public.
+# BUNGIE_CRAWLER_API_KEY secret, spends 2 hours reading players' profiles:
+# new players found through PvE matches that ended in the last 15 minutes,
+# and, with up to half its reads, players already in the store that it hasn't
+# read for a week. Each read gives the perks on every legendary they have
+# equipped, plus their vault when it's public, and when they last played.
+# Players signed in to D2 Conflux add their whole inventory: the site saves
+# their weapons as they load it, and each run reads the ones saved since its
+# last (POPULARITY_DATABASE_URL, a database role that can only read them).
 #
-# Each copy counts once, by its item instance id: the copy store (every copy
-# seen in the last 14 days, gzipped binary, too big for git) lives as an
-# asset of this repo's "copies" release. A run downloads the newest one, folds
-# its crawl in, uploads the result as a new asset and only then deletes the
-# older ones, so a failed upload loses nothing. The merge also writes
-# perk-popularity.json, which GitHub Pages serves at
+# Each copy counts once, by its item instance id, for as long as its owner
+# keeps playing: a player who hasn't played for 14 days drops out with their
+# copies. The store (every copy and whose it is, too big for git) lists the
+# players it found, so it's encrypted with the POPULARITY_STORE_KEY secret and
+# kept as an asset of this repo's "copies" release. A run downloads the
+# newest one, crawls and folds its crawl in, uploads the result as a new
+# asset and only then deletes the older ones, so a failed upload loses
+# nothing. The merge also writes perk-popularity.json, which GitHub Pages
+# serves at
 # https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
 # the app reads it without any Vercel bandwidth or functions.
 name: Crawl perk popularity
@@ -24,7 +32,7 @@ on:
     inputs:
       minutes:
         description: Minutes to crawl for
-        default: "25"
+        default: "120"
       recent:
         description: Find players through the matches that ended in the last this many minutes, moving along as it goes
         default: "15"
@@ -33,7 +41,7 @@ on:
         default: ""
       players:
         description: Stop early once this many players have been read
-        default: "50000"
+        default: "500000"
       app_ref:
         description: App repo branch or commit with the crawler (default the APP_REF variable)
         default: ""
@@ -47,13 +55,16 @@ concurrency:
 
 env:
   GH_TOKEN: ${{ github.token }}
-  # The release whose assets hold the copy store.
+  # The release whose assets hold the store.
   STORE_RELEASE: copies
+  # Store assets are named store-<run>-<id>.bin.
+  STORE_PREFIX: store-
+  POPULARITY_STORE_KEY: ${{ secrets.POPULARITY_STORE_KEY }}
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,50 +82,64 @@ jobs:
       - name: Install the app's dependencies
         working-directory: app
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Crawl recent matches
-        working-directory: app
-        env:
-          BUNGIE_CRAWLER_API_KEY: ${{ secrets.BUNGIE_CRAWLER_API_KEY }}
-          MINUTES: ${{ inputs.minutes || '25' }}
-          RECENT: ${{ inputs.recent || '15' }}
-          HOURS: ${{ inputs.hours }}
-          PLAYERS: ${{ inputs.players || '50000' }}
-        # The rate is the crawler's own default for the crawler key: 20 requests a
-        # second, slowing down for good each time Bungie throttles.
+      - name: Download the store
         run: |
-          run=$(date -u +%FT%H)
-          echo "RUN=$run" >> "$GITHUB_ENV"
-          if [ -n "$HOURS" ]; then window=(--hours="$HOURS"); else window=(--recent="$RECENT"); fi
-          npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" --minutes="$MINUTES" "${window[@]}" --out="$RUNNER_TEMP/$run.bin.gz"
-      - name: Download the copy store
-        run: |
+          echo "RUN=$(date -u +%FT%H)" >> "$GITHUB_ENV"
           if ! gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release create "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --title "Copy store" \
-              --notes "The perk-popularity copy store: every weapon copy seen in the last 14 days. Rewritten by every crawl."
+              --notes "The perk-popularity store, encrypted: every weapon copy of the players who've played in the last 14 days. Rewritten by every crawl."
           fi
           # The newest asset; older ones are only left behind by a run that failed before deleting them.
           newest=$(gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
-            -q '[.assets[] | select(.name | startswith("copies-"))] | sort_by(.createdAt) | last | .name // empty')
-          echo "NEWEST=$newest" >> "$GITHUB_ENV"
+            -q "[.assets[] | select(.name | startswith(\"$STORE_PREFIX\"))] | sort_by(.createdAt) | last | .name // empty")
           if [ -n "$newest" ]; then
-            gh release download "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --pattern "$newest" --output "$RUNNER_TEMP/copies.bin.gz"
+            gh release download "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --pattern "$newest" --output "$RUNNER_TEMP/store.bin"
           else
-            echo "No copy store yet; the merge starts one."
+            echo "No store yet; the merge starts one."
           fi
-      - name: Merge into the copy store
+      - name: Crawl
         working-directory: app
-        run: >
-          npx tsx scripts/merge-perk-popularity.ts
-          --store="$RUNNER_TEMP/copies.bin.gz" --add="$RUNNER_TEMP/$RUN.bin.gz" --days=14
-          --out=../data/perk-popularity.json
-      - name: Upload the copy store
+        env:
+          BUNGIE_CRAWLER_API_KEY: ${{ secrets.BUNGIE_CRAWLER_API_KEY }}
+          MINUTES: ${{ inputs.minutes || '120' }}
+          RECENT: ${{ inputs.recent || '15' }}
+          HOURS: ${{ inputs.hours }}
+          PLAYERS: ${{ inputs.players || '500000' }}
+        # The rate is the crawler's own default for the crawler key: 20 requests a
+        # second, slowing down for good each time Bungie throttles.
         run: |
-          name="copies-$RUN-$GITHUB_RUN_ID.bin.gz"
-          cp "$RUNNER_TEMP/copies.bin.gz" "$RUNNER_TEMP/$name"
+          if [ -n "$HOURS" ]; then window=(--hours="$HOURS"); else window=(--recent="$RECENT"); fi
+          store=(); if [ -e "$RUNNER_TEMP/store.bin" ]; then store=(--store="$RUNNER_TEMP/store.bin"); fi
+          npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" --minutes="$MINUTES" "${window[@]}" "${store[@]}" --out="$RUNNER_TEMP/$RUN.bin"
+      - name: Read signed-in players' weapons
+        working-directory: app
+        # A database hiccup shouldn't cost the crawl: the merge goes on without them, and
+        # the next run picks up where the store says the last one left off.
+        continue-on-error: true
+        env:
+          POPULARITY_DATABASE_URL: ${{ secrets.POPULARITY_DATABASE_URL }}
+        # Skipped until the secret is set, or on an app ref from before the script.
+        run: |
+          if [ -z "$POPULARITY_DATABASE_URL" ] || [ ! -f scripts/fetch-popularity-contributions.ts ]; then
+            echo "Not reading signed-in players' weapons."; exit 0
+          fi
+          store=(); if [ -e "$RUNNER_TEMP/store.bin" ]; then store=(--store="$RUNNER_TEMP/store.bin"); fi
+          npx tsx scripts/fetch-popularity-contributions.ts "${store[@]}" --out="$RUNNER_TEMP/signed-in-$RUN.bin"
+      - name: Merge into the store
+        working-directory: app
+        run: |
+          add=(--add="$RUNNER_TEMP/$RUN.bin")
+          if [ -e "$RUNNER_TEMP/signed-in-$RUN.bin" ]; then add+=(--add="$RUNNER_TEMP/signed-in-$RUN.bin"); fi
+          npx tsx scripts/merge-perk-popularity.ts --store="$RUNNER_TEMP/store.bin" "${add[@]}" --days=14 \
+            --out=../data/perk-popularity.json
+      - name: Upload the store
+        run: |
+          name="$STORE_PREFIX$RUN-$GITHUB_RUN_ID.bin"
+          cp "$RUNNER_TEMP/store.bin" "$RUNNER_TEMP/$name"
           gh release upload "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" "$RUNNER_TEMP/$name"
           # Only now that the new store is up: the older ones.
           gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
-            -q ".assets[] | select(.name | startswith(\"copies-\")) | select(.name != \"$name\") | .name" |
+            -q ".assets[] | select(.name | startswith(\"$STORE_PREFIX\")) | select(.name != \"$name\") | .name" |
             while read -r old; do gh release delete-asset "$STORE_RELEASE" "$old" -R "$GITHUB_REPOSITORY" --yes; done
       - name: Publish
         working-directory: data
@@ -124,6 +149,8 @@ jobs:
           git add perk-popularity.json
           git diff --cached --quiet && exit 0
           git commit -m "Perk popularity $RUN"
-          # Another run may have published meanwhile; land on top of it.
-          git pull --rebase
+          # Another run may have published meanwhile (a run that waited for it checked out
+          # the commit it was triggered on): land on top, this snapshot winning, since it
+          # was built from the newer store.
+          git pull --rebase -X theirs
           git push
