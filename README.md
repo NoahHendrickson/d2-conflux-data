@@ -4,7 +4,7 @@ Data snapshots for [D2 Conflux](https://d2conflux.com), published with GitHub Pa
 
 ## perk-popularity.json
 
-How often players run each perk, and each left + right perk combo, on legendary weapons in PvE. A daily GitHub Action (`.github/workflows/crawl.yml`) samples about 20,000 players from the last 24 hours of PvE matches through Bungie's public API: post-game reports give the players, and their profiles give the perks on the weapons they used in that match. Each day is saved in `daily/`, and `perk-popularity.json` adds up the last 7 days. Only the tallies are kept; nothing identifies a player.
+How often players run each perk, and each left + right perk combo, on legendary weapons in PvE. A GitHub Action (`.github/workflows/crawl.yml`) runs every 3 hours and spends 25 minutes sampling PvE matches that ended in the last 15 minutes, through Bungie's public API: post-game reports give the players, and their characters give the perks on the weapons they used in that match. Each run is saved in `daily/` (`2026-10-19T03.json`; a backfilled day is one `2026-10-15.json`), and `perk-popularity.json` adds up the last 7 days. Only the tallies are kept; nothing identifies a player.
 
 The crawler and merge live in the app repo (`scripts/crawl-perk-popularity.ts`, `scripts/merge-perk-popularity.ts`), and the format is described in `src/lib/weapons/perk-popularity.ts` there. The app repo branch the Action runs is the `APP_REF` repository variable (default `main`).
 

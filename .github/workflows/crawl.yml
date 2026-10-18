@@ -1,30 +1,39 @@
-# Daily perk-popularity crawl for D2 Conflux's weapon page (PvE only).
+# Perk-popularity crawl for D2 Conflux's weapon page (PvE only).
 #
-# Each run checks out the app repo (public, so no token needed) at the APP_REF
-# repository variable (default main), samples about 20k players from the last
-# 24 hours of PvE matches with this repo's BUNGIE_CRAWLER_API_KEY secret, and
-# saves that day as daily/<UTC date>.json. The merge then adds up the last 7
-# days into perk-popularity.json and deletes older days. GitHub Pages serves it
-# at https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
+# Every 3 hours a run checks out the app repo (public, so no token needed) at
+# the APP_REF repository variable (default main) and, with this repo's
+# BUNGIE_CRAWLER_API_KEY secret, spends 25 minutes sampling players from PvE
+# matches that ended in the last 15 minutes, so the weapons it reads are still
+# the ones they used. Each run is saved as daily/<UTC date>T<hour>.json. The
+# merge then adds up the last 7 days into perk-popularity.json and deletes
+# older files. GitHub Pages serves it at
+# https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
 # the app reads it without any Vercel bandwidth or functions.
 name: Crawl perk popularity
 
 on:
   schedule:
-    - cron: "0 6 * * *" # daily, 06:00 UTC
+    # Every 3 hours, a few minutes past the hour (GitHub delays top-of-the-hour runs the most).
+    - cron: "17 */3 * * *"
   workflow_dispatch:
     inputs:
-      players:
-        description: Players to sample
-        default: "20000"
+      minutes:
+        description: Minutes to crawl for
+        default: "25"
+      recent:
+        description: Sample the matches that ended in the last this many minutes, moving along as it goes
+        default: "15"
       hours:
-        description: Hours of matches to sample from
-        default: "24"
+        description: "Sample a fixed window of the past this many hours instead (leave empty for recent matches)"
+        default: ""
+      players:
+        description: Stop early once this many players have been read
+        default: "50000"
       app_ref:
         description: App repo branch or commit with the crawler (default the APP_REF variable)
         default: ""
       backfill_days:
-        description: "Backfill instead: UTC dates (YYYY-MM-DD, space-separated) to crawl the way that day's scheduled run would have. Days already saved are skipped."
+        description: "Backfill instead: UTC dates (YYYY-MM-DD, space-separated) to crawl the 24 hours before that day's 06:00 UTC. Days with any crawl saved are skipped."
         default: ""
 
 permissions:
@@ -55,44 +64,56 @@ jobs:
       - name: Install the app's dependencies
         working-directory: app
         run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Crawl the last day (or backfill past days)
+      - name: Crawl recent matches (or backfill past days)
+        id: crawl
         working-directory: app
         env:
           BUNGIE_CRAWLER_API_KEY: ${{ secrets.BUNGIE_CRAWLER_API_KEY }}
           BACKFILL_DAYS: ${{ inputs.backfill_days }}
-          PLAYERS: ${{ inputs.players || '20000' }}
-          HOURS: ${{ inputs.hours || '24' }}
+          MINUTES: ${{ inputs.minutes || '25' }}
+          RECENT: ${{ inputs.recent || '15' }}
+          HOURS: ${{ inputs.hours }}
+          PLAYERS: ${{ inputs.players || '50000' }}
+        # The rate is the crawler's own default for the crawler key: 20 requests a
+        # second, slowing down for good each time Bungie throttles.
         run: |
           mkdir -p ../data/daily
-          if [ -z "$BACKFILL_DAYS" ]; then
-            echo "DAY=$(date -u +%F)" >> "$GITHUB_ENV"
-            npx tsx scripts/crawl-perk-popularity.ts \
-              --players="$PLAYERS" --hours="$HOURS" \
-              --minutes=240 --rate=8 --workers=6 \
-              --out=../data/daily/$(date -u +%F).json
+          crawl() { npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" "$@"; }
+          if [ -n "$BACKFILL_DAYS" ]; then
+            # One day after another in this one run (separate runs would cancel
+            # each other's queue slot). A day with any crawl saved is left alone.
+            echo "DAY=backfill $BACKFILL_DAYS" >> "$GITHUB_ENV"
+            for day in $BACKFILL_DAYS; do
+              if compgen -G "../data/daily/$day*.json" > /dev/null; then
+                echo "daily/$day already has a crawl; skipping."
+                continue
+              fi
+              crawl --day="$day" --hours=24 --minutes=75 --out="../data/daily/$day.json"
+              echo "crawled=true" >> "$GITHUB_OUTPUT"
+            done
             exit 0
           fi
-          # Backfill: one day after another in this one run (separate runs
-          # would cancel each other's queue slot). A day already saved is
-          # never overwritten.
-          echo "DAY=backfill $BACKFILL_DAYS" >> "$GITHUB_ENV"
-          for day in $BACKFILL_DAYS; do
-            if [ -e "../data/daily/$day.json" ]; then
-              echo "daily/$day.json is already saved; skipping."
-              continue
-            fi
-            npx tsx scripts/crawl-perk-popularity.ts \
-              --day="$day" --players="$PLAYERS" --hours="$HOURS" \
-              --minutes=75 --rate=8 --workers=6 \
-              --out="../data/daily/$day.json"
-          done
+          run=$(date -u +%FT%H)
+          echo "DAY=$run" >> "$GITHUB_ENV"
+          if [ -e "../data/daily/$run.json" ]; then
+            echo "daily/$run.json is already saved this hour; not overwriting it."
+            exit 0
+          fi
+          if [ -n "$HOURS" ]; then
+            crawl --hours="$HOURS" --minutes="$MINUTES" --out="../data/daily/$run.json"
+          else
+            crawl --recent="$RECENT" --minutes="$MINUTES" --out="../data/daily/$run.json"
+          fi
+          echo "crawled=true" >> "$GITHUB_OUTPUT"
       - name: Merge the last 7 days
+        if: steps.crawl.outputs.crawled == 'true'
         working-directory: app
         run: >
           npx tsx scripts/merge-perk-popularity.ts
           --dir=../data/daily --days=7
           --out=../data/perk-popularity.json --prune
       - name: Publish
+        if: steps.crawl.outputs.crawled == 'true'
         working-directory: data
         run: |
           git config user.name "github-actions[bot]"
