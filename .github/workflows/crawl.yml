@@ -23,6 +23,17 @@
 # https://noahhendrickson.github.io/d2-conflux-data/perk-popularity.json, so
 # the app reads it without any Vercel bandwidth or functions.
 #
+# The same crawl tallies the armor sets players wear in raids, dungeons, GM
+# Vanguard Alerts and Conquests (--armor-out): each character's latest set
+# bonuses per activity type, kept 14 days in its own encrypted store (the
+# armor-store-* asset of the same release) and published as
+# armor-set-popularity.json for the optimizer. It's skipped on an app ref from
+# before the armor tally (with a warning once a snapshot is published, which
+# then stops updating). A failure anywhere in it, the crawler's tally, its
+# merge or its upload, never holds up the weapons. A lost armor store isn't
+# restarted quietly: once a snapshot is published, a run that finds no store
+# skips armor with a warning until dispatched with bootstrap=true.
+#
 # A run dispatched on any branch but main, or on main with an app_ref (trying
 # a crawler change), is a test: it starts from its own test-store-* asset (the
 # real store, copied, the first time), writes only that, and publishes
@@ -57,7 +68,7 @@ on:
         description: App repo branch or commit with the crawler (default the APP_REF variable; setting it makes the run a test)
         default: ""
       bootstrap:
-        description: "On main, start a new store when the release has none (otherwise the run stops, since an empty store would publish an empty snapshot)"
+        description: "On main, start a new store when the release has none (otherwise the run stops, since an empty store would publish an empty snapshot; a missing armor set store only skips armor)"
         type: boolean
         default: false
 
@@ -76,6 +87,8 @@ env:
   TEST: ${{ github.ref_name != 'main' || inputs.app_ref != '' }}
   # Store assets are named store-<run>-<id>-<attempt>.bin; a test run keeps its own, test-store-*.
   STORE_PREFIX: ${{ (github.ref_name != 'main' || inputs.app_ref != '') && 'test-store-' || 'store-' }}
+  # The armor set store's assets: armor-store-<run>-<id>-<attempt>.bin, a test's test-armor-store-*.
+  ARMOR_PREFIX: ${{ (github.ref_name != 'main' || inputs.app_ref != '') && 'test-armor-store-' || 'armor-store-' }}
   POPULARITY_STORE_KEY: ${{ secrets.POPULARITY_STORE_KEY }}
 
 jobs:
@@ -129,6 +142,19 @@ jobs:
           else
             echo "No store yet; the merge starts one."
           fi
+          # The armor set store. Before any armor snapshot is published, none just starts a new one
+          # (it fills within a run). After, none means it was lost: starting over would quietly swap
+          # the 14-day snapshot for one run's worth, so armor sits this run out unless bootstrapped.
+          armor=$(newest "$ARMOR_PREFIX")
+          if [ -z "$armor" ] && [ "$TEST" = true ]; then armor=$(newest armor-store-); fi
+          if [ -n "$armor" ]; then
+            gh release download "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --pattern "$armor" --output "$RUNNER_TEMP/armor-store.bin"
+          elif [ "$TEST" = false ] && [ -e data/armor-set-popularity.json ] && [ "$BOOTSTRAP" != true ]; then
+            echo "::warning::The $STORE_RELEASE release has no $ARMOR_PREFIX* asset, though armor-set-popularity.json is published. Skipping armor this run; dispatch with bootstrap=true to start a new armor set store."
+            echo "SKIP_ARMOR=true" >> "$GITHUB_ENV"
+          else
+            echo "No armor set store yet; the armor merge starts one."
+          fi
       - name: Crawl
         working-directory: app
         env:
@@ -142,7 +168,16 @@ jobs:
         run: |
           if [ -n "$HOURS" ]; then window=(--hours="$HOURS"); else window=(--recent="$RECENT"); fi
           store=(); if [ -e "$RUNNER_TEMP/store.bin" ]; then store=(--store="$RUNNER_TEMP/store.bin"); fi
-          npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" --minutes="$MINUTES" "${window[@]}" "${store[@]}" --out="$RUNNER_TEMP/$RUN.bin"
+          # The armor tally, on an app ref that has it (and a store to fold it into, see the download).
+          armor=()
+          if [ "$SKIP_ARMOR" = true ]; then
+            echo "Crawling without the armor tally (no armor set store)."
+          elif grep -q -- '"armor-out"' scripts/crawl-perk-popularity.ts; then
+            armor=(--armor-out="$RUNNER_TEMP/armor-$RUN.bin")
+          elif [ -e ../data/armor-set-popularity.json ]; then
+            echo "::warning::This app ref's crawler has no armor tally; armor-set-popularity.json won't update this run."
+          fi
+          npx tsx scripts/crawl-perk-popularity.ts --players="$PLAYERS" --minutes="$MINUTES" "${window[@]}" "${store[@]}" "${armor[@]}" --out="$RUNNER_TEMP/$RUN.bin"
       - name: Read signed-in players' weapons
         working-directory: app
         # A database hiccup shouldn't cost the crawl: the merge goes on without them, and
@@ -164,6 +199,15 @@ jobs:
           if [ -e "$RUNNER_TEMP/signed-in-$RUN.bin" ]; then add+=(--add="$RUNNER_TEMP/signed-in-$RUN.bin"); fi
           npx tsx scripts/merge-perk-popularity.ts --store="$RUNNER_TEMP/store.bin" "${add[@]}" --days=14 \
             --out=../data/perk-popularity.json
+      - name: Merge armor sets
+        id: armor-merge
+        working-directory: app
+        # The weapons go on without it.
+        continue-on-error: true
+        run: |
+          if [ ! -e "$RUNNER_TEMP/armor-$RUN.bin" ]; then echo "No armor crawl this run."; exit 0; fi
+          npx tsx scripts/merge-armor-set-popularity.ts --store="$RUNNER_TEMP/armor-store.bin" --add="$RUNNER_TEMP/armor-$RUN.bin" --days=14 \
+            --out=../data/armor-set-popularity.json
       - name: Upload the store
         run: |
           [ -n "$STORE_PREFIX" ] || { echo "::error::STORE_PREFIX is empty."; exit 1; }
@@ -175,6 +219,23 @@ jobs:
           gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
             -q ".assets[] | select(.name | startswith(\"$STORE_PREFIX\")) | select(.name != \"$name\") | .name" |
             while read -r old; do gh release delete-asset "$STORE_RELEASE" "$old" -R "$GITHUB_REPOSITORY" --yes; done
+      - name: Upload the armor set store
+        # Only a store this run merged a crawl into (none otherwise, or an unchanged one), and,
+        # like the merge, never at the weapons' expense.
+        if: steps.armor-merge.outcome == 'success'
+        continue-on-error: true
+        run: |
+          if [ ! -e "$RUNNER_TEMP/armor-$RUN.bin" ] || [ ! -e "$RUNNER_TEMP/armor-store.bin" ]; then
+            echo "No armor set store merged this run."; exit 0
+          fi
+          [ -n "$ARMOR_PREFIX" ] || { echo "::error::ARMOR_PREFIX is empty."; exit 1; }
+          name="$ARMOR_PREFIX$RUN-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.bin"
+          cp "$RUNNER_TEMP/armor-store.bin" "$RUNNER_TEMP/$name"
+          gh release upload "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" "$RUNNER_TEMP/$name"
+          # Only now that the new store is up: the older ones.
+          gh release view "$STORE_RELEASE" -R "$GITHUB_REPOSITORY" --json assets \
+            -q ".assets[] | select(.name | startswith(\"$ARMOR_PREFIX\")) | select(.name != \"$name\") | .name" |
+            while read -r old; do gh release delete-asset "$STORE_RELEASE" "$old" -R "$GITHUB_REPOSITORY" --yes; done
       - name: Publish
         # Not from a test: what it merged stays in its test store.
         if: env.TEST == 'false'
@@ -183,8 +244,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
           git add perk-popularity.json
+          if [ -e armor-set-popularity.json ]; then git add armor-set-popularity.json; fi
           git diff --cached --quiet && exit 0
-          git commit -m "Perk popularity $RUN"
+          git commit -m "Popularity $RUN"
           # Another run may have published meanwhile (a run that waited for it checked out
           # the commit it was triggered on): land on top, this snapshot winning, since it
           # was built from the newer store.
